@@ -1900,13 +1900,21 @@ extern "C" void zb_apsde_data_request(zb_uint8_t param);
 // plain path and esp_zb_aps_data_request() schedule through this same function.
 extern "C" zb_ret_t zb_schedule_callback(zb_callback_t func, zb_uint8_t param);
 
-// The tx confirm is matched to its request by the ZCL TSN. It used to be re-read from
-// the payload of the confirm buffer, which for an APS-secured frame does not give the
-// TSN (bench: 23 of 26 confirms lost, the host timed out although the device had
-// answered). The TSN is now remembered per buffer id when a request is handed to ZBOSS.
-// Only the ZBOSS task reads or writes these (do_request and the tx callback).
-static uint8_t s_apsde_tsn_by_buf[256];
-static bool s_apsde_tsn_valid[256];
+// The tx confirm used to be matched to its request by the ZCL TSN read back from the
+// confirm buffer's payload. For an APS-secured frame that byte is not the TSN (bench:
+// 23 of 26 confirms lost, APS-SEC-1), and a TSN is not unique anyway: two requests
+// that share one, or a late confirm after the watchdog freed and re-used the slot,
+// could take each other's confirm. Each send now records which slot, in which
+// allocation, its buffer belongs to (APS-SEC-2), and a confirm is matched only through
+// that record. Only the ZBOSS task reads or writes this table (do_request and the tx
+// callback).
+struct apsde_sent_t {
+    size_t old;      // the slot's allocation counter (request_t::old) at send time
+    uint8_t idx;     // slot index
+    bool valid;
+};
+static_assert(zb_ncp::MAX_PARALLEL_REQUESTS <= 256, "apsde_sent_t::idx is a uint8_t");
+static apsde_sent_t s_apsde_sent[256];
 
 template<>
 struct zb_ncp::cmd_handle<APSDE_DATA_REQ> : request_cmd_resolver<APSDE_DATA_REQ,APSDE_DATA_REQ_max_arg_t>, cmd_base<cmd_handle<APSDE_DATA_REQ>> {
@@ -1954,26 +1962,28 @@ struct zb_ncp::cmd_handle<APSDE_DATA_REQ> : request_cmd_resolver<APSDE_DATA_REQ,
             	ind->dst_endpoint,ind->src_endpoint,
             	IEEE_ADDR_PRINT(ind->addr),int(ind->dst_addr_mode),int(data_ptr[1]),int(len),data_ptr);
 
-            // APS-SEC-1: take the TSN remembered for this buffer; the payload byte
-            // is only a fallback (it is not the TSN for an APS-secured frame).
-            uint8_t tsn = data_ptr[1];
-            if (s_apsde_tsn_valid[param]) {
-                tsn = s_apsde_tsn_by_buf[param];
-                s_apsde_tsn_valid[param] = false;
-            }
-
             // DISP-2: claim+free the slot atomically before the blocking
-            // handle_response/report_failed send.
+            // handle_response/report_failed send. APS-SEC-2: only by the slot and
+            // allocation recorded for this buffer. A confirm on a buffer without a
+            // record is dropped: ZBOSS copies of a sent buffer inherit
+            // ZB_BUF_HAS_APS_USER_PAYLOAD (binding-table sends make such copies), so
+            // such a confirm cannot be tied to a request, and matching it by TSN
+            // could answer the wrong one. A request left without its confirm is freed
+            // by the slot watchdog.
             ResolveStrategy::request_t req;
-            if (ResolveStrategy::resolve_take(tsn, req)) {
-            	ESP_LOGD(TAG,"%s::aps_user_payload_callback %d",Cmd::name,int(tsn));
+            const apsde_sent_t sent = s_apsde_sent[param];
+            s_apsde_sent[param].valid = false;
+            if (!sent.valid) {
+            	ESP_LOGW(TAG,"%s: confirm on buffer %d without a send record, dropped",Cmd::name,int(param));
+            } else if (ResolveStrategy::resolve_take_at(sent.idx, sent.old, req)) {
+            	ESP_LOGD(TAG,"%s::aps_user_payload_callback %d",Cmd::name,int(req.tsn));
 	        	if (ind->status == 0) {
 	        		 Cmd::handle_response(req,ind);
 	        	} else {
 	        		report_failed(req.cmd,ind->status);
 	        	}
             } else {
-            	ESP_LOGW(TAG,"%s not found request for response %d",Cmd::name,int(tsn));
+            	ESP_LOGW(TAG,"%s: confirm for slot %d after its request was freed or re-used",Cmd::name,int(sent.idx));
             }
 
 
@@ -2025,7 +2035,9 @@ struct zb_ncp::cmd_handle<APSDE_DATA_REQ> : request_cmd_resolver<APSDE_DATA_REQ,
         r->base.addr_mode = arg.hdr.base.addr_mode;
         r->base.tx_options = APSDE_TX_OPT_SECURITY | APSDE_TX_OPT_ACK;
         zb_buf_flags_or(buf, ZB_BUF_HAS_APS_USER_PAYLOAD);
-        // If this fails, do_request frees the buffer like for any rejected send.
+        // Only queues the request: zb_schedule_callback returns RET_OK or asserts on a
+        // full queue, so from here the buffer is ZBOSS's. The one rejection in this
+        // function is the size check above; do_request frees the buffer for it.
         return zb_schedule_callback(zb_apsde_data_request, buf);
     }
 
@@ -2054,10 +2066,10 @@ struct zb_ncp::cmd_handle<APSDE_DATA_REQ> : request_cmd_resolver<APSDE_DATA_REQ,
                 arg.hdr.dataLength);
         }
         if (ret == RET_OK) {
-            // APS-SEC-1: the confirm is deferred (never synchronous inside the send,
+            // APS-SEC-2: the confirm is deferred (never synchronous inside the send,
             // see DISP-2 in do_request), so recording after the call races nothing.
-            s_apsde_tsn_by_buf[buf] = req.tsn;
-            s_apsde_tsn_valid[buf] = true;
+            // The slot is S_ALLOCATION here, so `old` cannot change under us.
+            s_apsde_sent[buf] = { req.old, uint8_t(ResolveStrategy::get_req_idx(&req)), true };
         }
         return ret;
     }
@@ -2144,8 +2156,10 @@ struct zb_ncp::cmd_handle<APSDE_DATA_REQ> : request_cmd_resolver<APSDE_DATA_REQ,
     		report_failed(cmd,GENERIC_INVALID_PARAMETER);
     		return;
     	}
-    	// M4: start_request reads arg.data[1] as the ZCL frame TSN for response
-    	// matching (remembered per buffer id, APS-SEC-1). Need >= 2 data bytes.
+    	// M4: start_request reads arg.data[1] as the ZCL frame TSN (kept in the
+    	// slot for logs; confirms are matched by slot since APS-SEC-2). Every ZCL
+    	// frame has >= 3 bytes; shorter payloads were always refused here and
+    	// still are.
     	if (arg->dataLength < 2) {
     		ESP_LOGE(TAG,"APSDE_DATA_REQ: dataLength %u too small for ZCL header",
     		         unsigned(arg->dataLength));

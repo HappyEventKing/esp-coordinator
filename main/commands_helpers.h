@@ -340,6 +340,26 @@ struct request_cmd_resolver {
 		return false;
 	}
 
+	// APS-SEC-2: take exactly the request a confirm belongs to — slot `idx`, and
+	// only while it still carries the allocation it was sent with (`old` is
+	// unique per start_resolve). A slot the watchdog freed or start_resolve
+	// re-assigned in the meantime no longer matches, so a late confirm is
+	// dropped instead of landing on a newer request; two requests that happen to
+	// share a ZCL TSN can no longer take each other's confirm.
+	static bool resolve_take_at(uint16_t idx, size_t old, request_t& out) {
+		if (idx >= zb_ncp::MAX_PARALLEL_REQUESTS) {
+			return false;
+		}
+		utils::sem_lock l(request_resolver_mutex());
+		auto& req = storage()[idx];
+		if (req.state != request_t::S_EXEC || req.old != old) {
+			return false;
+		}
+		out = req;
+		req.state = request_t::S_NONE;
+		return true;
+	}
+
 	// Watchdog reclaim: free every S_EXEC slot whose TX-confirm never came back
 	// within `timeout_ticks` (an unreachable/dead device whose confirm never
 	// fires would otherwise leak the slot forever — see the apsde-slot-leak
