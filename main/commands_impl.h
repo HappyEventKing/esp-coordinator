@@ -2025,11 +2025,8 @@ struct zb_ncp::cmd_handle<APSDE_DATA_REQ> : request_cmd_resolver<APSDE_DATA_REQ,
         r->base.addr_mode = arg.hdr.base.addr_mode;
         r->base.tx_options = APSDE_TX_OPT_SECURITY | APSDE_TX_OPT_ACK;
         zb_buf_flags_or(buf, ZB_BUF_HAS_APS_USER_PAYLOAD);
-        const zb_ret_t ret = zb_schedule_callback(zb_apsde_data_request, buf);
-        if (ret != RET_OK) {
-            zb_buf_free(buf);   // never reached ZBOSS, so nothing else frees it
-        }
-        return ret;
+        // If this fails, do_request frees the buffer like for any rejected send.
+        return zb_schedule_callback(zb_apsde_data_request, buf);
     }
 
     template <typename ArgVar>
@@ -2088,7 +2085,12 @@ struct zb_ncp::cmd_handle<APSDE_DATA_REQ> : request_cmd_resolver<APSDE_DATA_REQ,
     		ret = start_request(buf,arg,req);
     	}
     	if (ret != 0) {
-    		ESP_LOGE(TAG,"failed zb_aps_send_user_payload %02x",int(ret));
+    		ESP_LOGE(TAG,"APSDE send rejected %d",int(ret));
+    		// Both send paths reject before ZBOSS takes the buffer
+    		// (zb_aps_send_user_payload checks its arguments and the 82-byte
+    		// limit first), so it is still ours. It used to leak here, one
+    		// buffer per rejected request; the generic helper frees too.
+    		zb_buf_free(buf);
     		zb_ncp::cmd_t failed_cmd;
     		{	utils::sem_lock l(request_resolver_mutex());
     			failed_cmd = req.cmd;
